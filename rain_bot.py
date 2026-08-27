@@ -33,6 +33,7 @@ Intended to run once per day via a scheduled job (cron / Render).
 import csv
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,8 @@ STAKE_DOLLARS = float(os.getenv("STAKE_DOLLARS", "1"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.10"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.90"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
+FILL_RETRY_SECONDS = float(os.getenv("FILL_RETRY_SECONDS", "25"))
+FILL_RETRY_INTERVAL = float(os.getenv("FILL_RETRY_INTERVAL", "5"))
 
 
 def already_traded(c: KalshiClient, event_ticker: str) -> set:
@@ -85,7 +88,7 @@ def log_trade(row: dict):
     with open(LOG_PATH, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
             "placed_at", "ticker", "city", "event_ticker", "yes_bid", "yes_ask",
-            "order_price", "count", "notional", "fill_count", "status", "dry_run",
+            "fill_count", "notional", "fee", "attempts", "status", "dry_run",
         ])
         if is_new:
             w.writeheader()
@@ -106,6 +109,87 @@ def target_event_ticker(c: KalshiClient) -> str:
     if not events:
         raise RuntimeError("No open KXRAIN events found at all")
     return events[-1]
+
+
+def fetch_quote(c: KalshiClient, ticker: str):
+    r = c.get(f"/markets/{ticker}", auth=False)
+    r.raise_for_status()
+    m = r.json()["market"]
+    return float(m["yes_ask_dollars"]), float(m["yes_bid_dollars"])
+
+
+def place_no_with_retry(c: KalshiClient, ticker: str, target_notional: float) -> dict:
+    """Places IOC 'buy NO' orders against target_notional dollars, re-quoting
+    and retrying whatever remains unfilled for up to FILL_RETRY_SECONDS.
+    A single IOC can under-fill if the opposing book doesn't have enough
+    size sitting at the aggressive price -- seen for real on the first
+    live run (ATL filled 1.00 of a ~1.56-contract target, LV filled 1.00
+    of a ~7.14-contract target). Mirrors the proven retry pattern in
+    kalshi/martingale_bot_1h.py's place_with_retry, adapted to track total
+    dollars spent rather than a fixed contract count, since retries can
+    fill at different prices as the quote moves between attempts."""
+    remaining_notional = target_notional
+    total_filled = 0.0
+    total_cost = 0.0
+    total_fee = 0.0
+    deadline = time.time() + FILL_RETRY_SECONDS
+    attempt = 0
+    last_yes_bid = last_yes_ask = None
+
+    while remaining_notional > 0.005:
+        attempt += 1
+        yes_ask, yes_bid = fetch_quote(c, ticker)
+        last_yes_bid, last_yes_ask = yes_bid, yes_ask
+        limit_price = max(round(yes_bid - 0.01, 2), 0.01)
+        count = round(remaining_notional / limit_price, 2)
+        if count <= 0:
+            break
+
+        order = {
+            "ticker": ticker,
+            "side": "ask",
+            "count": f"{count:.2f}",
+            "price": f"{limit_price:.2f}",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": str(uuid.uuid4()),
+        }
+
+        if DRY_RUN:
+            print(f"{ticker}: DRY_RUN attempt {attempt}, would place {order}")
+            return {
+                "filled": count, "cost": round(count * limit_price, 2), "fee": 0.0,
+                "yes_bid": yes_bid, "yes_ask": yes_ask, "attempts": attempt, "status": "dry_run",
+            }
+
+        resp = c.post("/portfolio/events/orders", json=order, auth=True)
+        print(f"{ticker}: attempt {attempt} order response {resp.status_code} {resp.text[:250]}")
+
+        if resp.status_code not in (200, 201):
+            break
+
+        body = resp.json()
+        fill_count = float(body.get("fill_count", "0"))
+        fill_price = float(body.get("average_fill_price", limit_price))
+        fee_paid = float(body.get("average_fee_paid", "0")) * fill_count
+
+        total_filled += fill_count
+        total_cost += fill_count * fill_price
+        total_fee += fee_paid
+        remaining_notional = target_notional - total_cost
+
+        if remaining_notional <= 0.005:
+            break
+        if time.time() >= deadline:
+            print(f"{ticker}: gave up after {attempt} attempts, filled ${total_cost:.2f}/${target_notional:.2f}")
+            break
+        time.sleep(FILL_RETRY_INTERVAL)
+
+    status = "filled" if total_filled > 0 else "no_fill"
+    return {
+        "filled": round(total_filled, 2), "cost": round(total_cost, 2), "fee": round(total_fee, 2),
+        "yes_bid": last_yes_bid, "yes_ask": last_yes_ask, "attempts": attempt, "status": status,
+    }
 
 
 def check_balance(c: KalshiClient, planned_spend: float):
@@ -165,40 +249,14 @@ def main():
 
     placed = 0
     for ticker, city, yes_bid, yes_ask in candidates:
-        # buying NO = selling into the yes_bid, 1c aggressive for a fast IOC fill
-        limit_price = max(round(yes_bid - 0.01, 2), 0.01)
-        count = round(STAKE_DOLLARS / limit_price, 2)
-
-        order = {
-            "ticker": ticker,
-            "side": "ask",
-            "count": f"{count:.2f}",
-            "price": f"{limit_price:.2f}",
-            "time_in_force": "immediate_or_cancel",
-            "self_trade_prevention_type": "taker_at_cross",
-            "client_order_id": str(uuid.uuid4()),
-        }
-
-        fill_count = 0.0
-        status = "dry_run"
-        if not DRY_RUN:
-            resp = c.post("/portfolio/events/orders", json=order, auth=True)
-            print(f"{ticker}: order response {resp.status_code} {resp.text[:200]}")
-            if resp.status_code == 200:
-                fill_count = float(resp.json().get("fill_count", "0"))
-                status = "filled" if fill_count > 0 else "no_fill"
-            else:
-                status = f"error_{resp.status_code}"
-        else:
-            fill_count = count
-            print(f"DRY_RUN: would place {order}")
+        result = place_no_with_retry(c, ticker, STAKE_DOLLARS)
 
         log_trade({
             "placed_at": datetime.now(timezone.utc).isoformat(),
             "ticker": ticker, "city": city, "event_ticker": event_ticker,
-            "yes_bid": yes_bid, "yes_ask": yes_ask, "order_price": limit_price,
-            "count": count, "notional": round(count * limit_price, 2),
-            "fill_count": fill_count, "status": status, "dry_run": DRY_RUN,
+            "yes_bid": result["yes_bid"], "yes_ask": result["yes_ask"],
+            "fill_count": result["filled"], "notional": result["cost"], "fee": result["fee"],
+            "attempts": result["attempts"], "status": result["status"], "dry_run": DRY_RUN,
         })
         placed += 1
 
