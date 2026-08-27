@@ -1,0 +1,5 @@
+.env
+*.pem
+trade_log.csv
+__pycache__/
+*.pyc

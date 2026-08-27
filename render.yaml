@@ -1,0 +1,25 @@
+services:
+  - type: cron
+    name: kalshi-rain-bot
+    runtime: python
+    # 10:30 UTC daily -- Kalshi opens each day's KXRAIN event at ~09:10 UTC
+    # the day before, so this leaves a safe buffer rather than risking a
+    # "not open yet" no-op if it ran right at the boundary.
+    schedule: "30 10 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u rain_bot.py
+    envVars:
+      - key: KALSHI_ENV
+        value: prod
+      - key: KALSHI_KEY_ID
+        sync: false
+      - key: KALSHI_PRIVATE_KEY_PEM
+        sync: false
+      - key: STAKE_DOLLARS
+        value: "1"
+      - key: MIN_PRICE
+        value: "0.10"
+      - key: MAX_PRICE
+        value: "0.90"
+      - key: DRY_RUN
+        value: "false"
