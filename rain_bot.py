@@ -140,8 +140,17 @@ def place_no_with_retry(c: KalshiClient, ticker: str, target_notional: float) ->
         attempt += 1
         yes_ask, yes_bid = fetch_quote(c, ticker)
         last_yes_bid, last_yes_ask = yes_bid, yes_ask
-        limit_price = max(round(yes_bid - 0.01, 2), 0.01)
-        count = round(remaining_notional / limit_price, 2)
+        # Kalshi's "price" field is always YES-denominated, even for a NO-side
+        # order -- confirmed against real fills (yes_price_dollars + no_price_dollars
+        # always sum to 1.00) and against /portfolio/positions' market_exposure_dollars
+        # (which matched count * (1 - submitted_price) exactly, not count * submitted_price).
+        # The true cost per NO contract is (1 - this price), NOT this price itself --
+        # dividing the target dollar amount by the raw yes-denominated price was the
+        # bug that caused $9-10 fills on a $1 target (see 2026-08-27 incident: ~$110
+        # actually spent against a ~$28 target, emergency-closed 17 positions).
+        submitted_yes_price = max(round(yes_bid - 0.01, 2), 0.01)
+        true_no_price = round(1 - submitted_yes_price, 2)
+        count = round(remaining_notional / true_no_price, 2)
         if count <= 0:
             break
 
@@ -149,7 +158,7 @@ def place_no_with_retry(c: KalshiClient, ticker: str, target_notional: float) ->
             "ticker": ticker,
             "side": "ask",
             "count": f"{count:.2f}",
-            "price": f"{limit_price:.2f}",
+            "price": f"{submitted_yes_price:.2f}",
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
             "client_order_id": str(uuid.uuid4()),
@@ -158,7 +167,7 @@ def place_no_with_retry(c: KalshiClient, ticker: str, target_notional: float) ->
         if DRY_RUN:
             print(f"{ticker}: DRY_RUN attempt {attempt}, would place {order}")
             return {
-                "filled": count, "cost": round(count * limit_price, 2), "fee": 0.0,
+                "filled": count, "cost": round(count * true_no_price, 2), "fee": 0.0,
                 "yes_bid": yes_bid, "yes_ask": yes_ask, "attempts": attempt, "status": "dry_run",
             }
 
@@ -170,11 +179,14 @@ def place_no_with_retry(c: KalshiClient, ticker: str, target_notional: float) ->
 
         body = resp.json()
         fill_count = float(body.get("fill_count", "0"))
-        fill_price = float(body.get("average_fill_price", limit_price))
+        # average_fill_price from the order response is also YES-denominated
+        # (same convention as the submitted price above) -- true cost is (1 - this).
+        fill_price_yes = float(body.get("average_fill_price", submitted_yes_price))
+        fill_price_no = round(1 - fill_price_yes, 4)
         fee_paid = float(body.get("average_fee_paid", "0")) * fill_count
 
         total_filled += fill_count
-        total_cost += fill_count * fill_price
+        total_cost += fill_count * fill_price_no
         total_fee += fee_paid
         remaining_notional = target_notional - total_cost
 
