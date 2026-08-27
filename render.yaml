@@ -23,3 +23,25 @@ services:
         value: "0.90"
       - key: DRY_RUN
         value: "false"
+
+  - type: cron
+    name: kalshi-rain-alert
+    runtime: python
+    # 08:30 UTC (4:30 AM ET) -- a 1h safety margin after the last
+    # timezone group (Pacific cities) finishes settling around 3:30 AM ET,
+    # so every position from that day is guaranteed resolved by the time
+    # this runs.
+    schedule: "30 8 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u rain_alert.py
+    envVars:
+      - key: KALSHI_ENV
+        value: prod
+      - key: KALSHI_KEY_ID
+        sync: false
+      - key: KALSHI_PRIVATE_KEY_PEM
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
