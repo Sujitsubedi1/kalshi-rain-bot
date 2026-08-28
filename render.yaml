@@ -27,11 +27,13 @@ services:
   - type: cron
     name: kalshi-rain-alert
     runtime: python
-    # 08:30 UTC (4:30 AM ET) -- a 1h safety margin after the last
-    # timezone group (Pacific cities) finishes settling around 3:30 AM ET,
-    # so every position from that day is guaranteed resolved by the time
-    # this runs.
-    schedule: "30 8 * * *"
+    # 15:30 UTC -- was 08:30 UTC, wrong: assumed settlement follows
+    # ~30min after each market's own close_time. Real observed behavior
+    # (2026-08-28) is Kalshi settles in batches ~7.5h after each timezone
+    # group's close: Eastern ~11:30 UTC, Central ~12:30 UTC, Pacific not
+    # until ~14:30 UTC for the same event. 15:30 UTC leaves a safety
+    # margin after the slowest (Pacific) group.
+    schedule: "30 15 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python -u rain_alert.py
     envVars:

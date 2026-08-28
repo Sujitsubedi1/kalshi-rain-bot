@@ -1,8 +1,13 @@
 """
 Daily Telegram summary for the rain bot, once each day's positions have
-fully settled (intended schedule: ~4:30 AM ET / 08:30 UTC, a safety
-margin after the last timezone group -- Pacific cities -- settles around
-3:30 AM ET; see rain_bot.py's settlement-timing notes).
+fully settled. Intended schedule: 15:30 UTC. Originally set to 08:30 UTC
+on the wrong assumption that settlement follows ~30min after each
+market's own close_time -- real observed behavior (2026-08-28) is that
+Kalshi settles in BATCHES roughly 7.5h after each timezone group's close,
+not per-market: Eastern cities settled at 11:30:55 UTC, Central at
+12:30:55 UTC (both to the exact second -- clearly a fixed batch job, not
+a variable delay), Pacific cities not until ~14:30 UTC. 15:30 UTC leaves
+a safety margin after the slowest (Pacific) group's batch.
 
 Stateless by design, same principle as rain_bot.py's idempotency check:
 Render's cron containers don't persist a local file between runs, so
@@ -10,6 +15,18 @@ every number here (today's result, cumulative P&L) is recomputed fresh
 from Kalshi's own /portfolio/fills + settled-market results each time,
 never from local state. A duplicate manual trigger just resends the same
 correct numbers rather than double-counting anything.
+
+Two bugs fixed 2026-08-28, both found by real Aug 27 settlement data
+(the first time any KXRAIN market actually settled since launch):
+1. Only reports on an event once ALL of our held tickers in it have a
+   result -- Kalshi's staggered batch settlement means a day's cities can
+   finish hours apart, so checking only "is there at least one settled
+   round" could report a partial, understated day.
+2. Drops any ticker we manually closed early (see
+   drop_manually_closed_tickers) instead of scoring it against the
+   eventual market result, which double-counted and misattributed the
+   2026-08-27 emergency cash-out as both a natural win/loss AND a
+   separate closing trade.
 
 Reuses the /portfolio/fills pagination + rounds-grouping pattern from
 kalshi/strategy_alerts.py, with one deliberate improvement: fills carry
@@ -103,26 +120,56 @@ def net_pnl(rnd: dict, result: str) -> float:
     return (rnd["count"] * 1.0 - rnd["cost"] - rnd["fee"]) if won else -(rnd["cost"] + rnd["fee"])
 
 
+def drop_manually_closed_tickers(rounds: list) -> list:
+    """A ticker we manually closed early (e.g. the 2026-08-27 emergency
+    cash-out) has TWO rounds: the original 'no' buy and a 'yes' buy-back
+    to flatten it. Scoring either against the eventual market result is
+    wrong -- we didn't hold a position by settlement time, so there's no
+    real win/loss to attribute to the market outcome. Drop every round for
+    any ticker that shows both sides, rather than try to reconstruct a
+    P&L number from the two legs; the real number for those (-$18.10) is
+    already known and tracked separately, by deliberate choice, not
+    recomputed here."""
+    sides_by_ticker = defaultdict(set)
+    for r in rounds:
+        sides_by_ticker[r["ticker"]].add(r["side"])
+    closed_tickers = {t for t, sides in sides_by_ticker.items() if len(sides) > 1}
+    if closed_tickers:
+        print(f"Excluding {len(closed_tickers)} manually-closed tickers from scoring: {sorted(closed_tickers)}")
+    return [r for r in rounds if r["ticker"] not in closed_tickers]
+
+
 def main():
     c = KalshiClient.from_env()
 
     rounds = fetch_all_rain_rounds(c)
+    rounds = drop_manually_closed_tickers(rounds)
     results = fetch_all_rain_results(c)
 
-    settled_rounds = [r for r in rounds if results.get(r["ticker"])]
-    if not settled_rounds:
-        print("No settled KXRAIN rounds yet -- nothing to report.")
-        return
-
-    # group settled rounds by event (the date-suffixed part of the ticker,
-    # e.g. KXRAIN-26AUG27), report on the single latest fully-settled event
+    # group ALL our rounds (settled or not) by event, so we can tell
+    # whether an event is fully done vs. only partially settled so far --
+    # reporting on a partial day (some cities settled, others still
+    # pending) would understate that day's real result. Kalshi settles in
+    # batches by timezone group, roughly 7.5h after each group's close, so
+    # a day's cities can finish hours apart (confirmed 2026-08-28: Eastern
+    # settled ~11:30 UTC, Pacific not until ~14:30 UTC for the same event).
     by_event = defaultdict(list)
-    for r in settled_rounds:
+    for r in rounds:
         event_ticker = r["ticker"].rsplit("-", 1)[0]
         by_event[event_ticker].append(r)
 
-    latest_event = max(by_event.keys(), key=parse_event_date)
+    fully_settled_events = [
+        evt for evt, evt_rounds in by_event.items()
+        if all(results.get(r["ticker"]) for r in evt_rounds)
+    ]
+    if not fully_settled_events:
+        print("No fully-settled KXRAIN event yet -- nothing to report.")
+        return
+
+    latest_event = max(fully_settled_events, key=parse_event_date)
     todays_rounds = by_event[latest_event]
+
+    settled_rounds = [r for r in rounds if results.get(r["ticker"])]
 
     total_staked = sum(r["cost"] + r["fee"] for r in todays_rounds)
     total_pnl = sum(net_pnl(r, results[r["ticker"]]) for r in todays_rounds)
@@ -130,7 +177,7 @@ def main():
     losses = len(todays_rounds) - wins
 
     cumulative_pnl = sum(net_pnl(r, results[r["ticker"]]) for r in settled_rounds)
-    days_active = len({r["ticker"].rsplit("-", 1)[0] for r in settled_rounds})
+    days_active = len({evt for evt in by_event if all(results.get(r["ticker"]) for r in by_event[evt])})
 
     date_label = latest_event.replace(SERIES_PREFIX, "")
     message = (
