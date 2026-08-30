@@ -139,11 +139,34 @@ def drop_manually_closed_tickers(rounds: list) -> list:
     return [r for r in rounds if r["ticker"] not in closed_tickers]
 
 
+def merge_rounds_by_ticker(rounds: list) -> list:
+    """place_no_with_retry can split one real bet across multiple orders
+    (a main fill plus a small top-up retry for the last fraction of a
+    cent -- confirmed for real on 2026-08-29: every one of 20 city-bets
+    had a ~99%-sized round plus a ~1c top-up round, both sharing the same
+    ticker but different order_ids). Counting rounds directly reports
+    '40 positions' for what was actually 20 real bets, and double-counts
+    the win/loss tally (though the dollar totals were still correct,
+    since summing is order-independent). Merge same-ticker rounds into
+    one before computing position counts / W-L, so the count reflects
+    real bets, not order-attempt fragments."""
+    by_ticker = {}
+    for r in rounds:
+        m = by_ticker.setdefault(r["ticker"], {
+            "ticker": r["ticker"], "side": r["side"], "count": 0.0, "cost": 0.0, "fee": 0.0,
+        })
+        m["count"] += r["count"]
+        m["cost"] += r["cost"]
+        m["fee"] += r["fee"]
+    return list(by_ticker.values())
+
+
 def main():
     c = KalshiClient.from_env()
 
     rounds = fetch_all_rain_rounds(c)
     rounds = drop_manually_closed_tickers(rounds)
+    rounds = merge_rounds_by_ticker(rounds)
     results = fetch_all_rain_results(c)
 
     # group ALL our rounds (settled or not) by event, so we can tell
