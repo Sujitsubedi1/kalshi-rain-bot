@@ -35,6 +35,7 @@ the existing crypto alerts report gross (count - cost), not net.
 """
 import os
 from collections import defaultdict
+from datetime import datetime
 
 import requests
 
@@ -45,13 +46,25 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SERIES_PREFIX = "KXRAIN-"
 
-# Risk-management checkpoint (2026-08-31 decision, see project memory):
-# +$21 cumulative by day 14 (~Sept 9) to justify doubling STAKE_DOLLARS;
-# -$30 cumulative at any point is a stop-loss flag -- deliberately NOT an
-# auto-pause. User's explicit call: flag it in the alert and let them
+# Risk-management checkpoint (2026-09-03 decision, see project memory):
+# +$21 cumulative by day 14 to justify doubling STAKE_DOLLARS; cumulative
+# at or beyond STOP_LOSS_DOLLARS is a stop-loss flag -- deliberately NOT
+# an auto-pause. User's explicit call: flag it in the alert and let them
 # decide manually (via DRY_RUN=true on Render) whether to actually stop,
-# rather than have the bot silently stop itself.
-STOP_LOSS_DOLLARS = float(os.getenv("STOP_LOSS_DOLLARS", "-30"))
+# rather than have the bot silently stop itself. Tightened from -$30 to
+# -$20 on 2026-09-03 alongside the clean-slate reset below -- after two
+# real bugs found in two weeks, more caution on the second real test.
+STOP_LOSS_DOLLARS = float(os.getenv("STOP_LOSS_DOLLARS", "-20"))
+
+# Clean-slate reset (2026-09-03): everything before this date was traded
+# under either the sizing bug (fixed 2026-08-27) or the buy-timing bug
+# (fixed 2026-09-03, see rain_bot.py's TIMING docstring) -- neither is a
+# fair test of the actual strategy, so neither counts toward the scale-up/
+# stop-loss tracking. KXRAIN-26SEP04 was still bought under the OLD
+# 10:30 UTC schedule (fired before the timing fix deployed); the first
+# event bought entirely by the new per-timezone-group schedule is
+# KXRAIN-26SEP05, so that's the real day-1 of clean tracking.
+CLEAN_START_DATE = datetime(2026, 9, 5)
 
 
 def send_telegram(message: str):
@@ -169,12 +182,25 @@ def merge_rounds_by_ticker(rounds: list) -> list:
     return list(by_ticker.values())
 
 
+def drop_pre_cutoff_rounds(rounds: list) -> list:
+    """Excludes any round from an event before CLEAN_START_DATE -- see the
+    constant's docstring. Applied once, up front, so every downstream
+    computation (today's report, cumulative, days_active) is automatically
+    scoped to the clean era without needing separate filtering."""
+    kept = [r for r in rounds if parse_event_date(r["ticker"].rsplit("-", 1)[0]) >= CLEAN_START_DATE]
+    dropped = len(rounds) - len(kept)
+    if dropped:
+        print(f"Excluding {dropped} pre-{CLEAN_START_DATE.date()} rounds (sizing/timing bug era, tracked separately)")
+    return kept
+
+
 def main():
     c = KalshiClient.from_env()
 
     rounds = fetch_all_rain_rounds(c)
     rounds = drop_manually_closed_tickers(rounds)
     rounds = merge_rounds_by_ticker(rounds)
+    rounds = drop_pre_cutoff_rounds(rounds)
     results = fetch_all_rain_results(c)
 
     # group ALL our rounds (settled or not) by event, so we can tell
