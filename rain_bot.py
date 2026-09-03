@@ -10,6 +10,30 @@ Only trades the 20 originally-backtested cities (VALIDATED_CITIES) --
 newer tickers like Newark/Trenton have zero track record and are
 deliberately skipped, not traded at reduced size.
 
+TIMING (fixed 2026-09-03, root-caused a real live-vs-backtest gap): the
+backtest's price snapshot was taken ~24h before each market's close --
+which, given Kalshi's close times, works out to early morning on the
+OBSERVED day itself (~04:00-07:00 UTC depending on timezone group; see
+CITY_GROUPS). The original schedule fired once at 10:30 UTC and always
+grabbed "whichever event just opened" -- which is always the FOLLOWING
+day's market, bought ~80 minutes after it opened, ~17-18h before the
+market had matured to the price point the edge was ever validated on.
+Verified for real on 103 live bets: using the actual (too-early) buy
+price showed a statistically significant -14.4pp gap between win rate
+and market-implied probability (-3.11 SE); recomputing the same 103 bets
+against the correct, backtest-timing price dropped that to +1.4pp
+(+0.30 SE, indistinguishable from noise) -- i.e. the edge was real all
+along, execution timing was hiding it.
+
+Fix: trade each timezone group separately, at ITS OWN correct time
+(CITY_GROUP env var selects which one this run covers), scheduled via
+4 separate Render cron entries instead of one. At each group's correct
+time, the next day's event genuinely hasn't opened yet (opens ~09:10
+UTC, hours after even the latest group's ~07:00 UTC slot), so
+target_event_ticker()'s "pick whichever event is furthest out and
+open" naturally lands on the correct (observed-day) event without
+needing any change to that logic -- only the schedule time was wrong.
+
 Safety:
 - DRY_RUN defaults to true. Must explicitly set DRY_RUN=false to place
   real orders.
@@ -60,12 +84,33 @@ VALIDATED_CITIES = {
     "MIA", "MIN", "NOLA", "NYC", "OKC", "PHIL", "PHX", "SATX", "SEA", "SFO",
 }
 
+# Matches the real settlement batches confirmed via settlement_ts on
+# 2026-08-28 (Eastern/Central to the exact second) and close_time
+# groupings since -- each group's correct trade time is close_time - 24h,
+# which lands at that group's own close hour, on the observed day itself.
+CITY_GROUPS = {
+    "EASTERN": {"ATL", "BOS", "DC", "MIA", "NYC", "PHIL"},       # close ~04:00 UTC
+    "CENTRAL": {"AUS", "CHI", "DAL", "HOU", "MIN", "NOLA", "OKC", "SATX"},  # ~05:00 UTC
+    "MOUNTAIN": {"DEN"},                                          # ~06:00 UTC
+    "PACIFIC": {"LAX", "LV", "PHX", "SEA", "SFO"},                # ~07:00 UTC
+}
+
 STAKE_DOLLARS = float(os.getenv("STAKE_DOLLARS", "1"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.10"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.90"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
 FILL_RETRY_SECONDS = float(os.getenv("FILL_RETRY_SECONDS", "25"))
 FILL_RETRY_INTERVAL = float(os.getenv("FILL_RETRY_INTERVAL", "5"))
+
+# Empty/unset CITY_GROUP -> trade all 20 (useful for manual runs/testing);
+# a Render cron entry sets this to one of EASTERN/CENTRAL/MOUNTAIN/PACIFIC.
+_city_group_name = os.getenv("CITY_GROUP", "").strip().upper()
+if _city_group_name:
+    if _city_group_name not in CITY_GROUPS:
+        raise RuntimeError(f"Unknown CITY_GROUP={_city_group_name!r}, must be one of {sorted(CITY_GROUPS)}")
+    ACTIVE_CITIES = CITY_GROUPS[_city_group_name]
+else:
+    ACTIVE_CITIES = VALIDATED_CITIES
 
 
 def already_traded(c: KalshiClient, event_ticker: str) -> set:
@@ -220,6 +265,7 @@ def main():
 
     if DRY_RUN:
         print("DRY_RUN=true -- no real orders will be placed. Set DRY_RUN=false to go live.")
+    print(f"Trading city group: {_city_group_name or 'ALL'} ({sorted(ACTIVE_CITIES)})")
 
     event_ticker = target_event_ticker(c)
     print(f"Target event: {event_ticker}")
@@ -233,14 +279,14 @@ def main():
 
     done = already_traded(c, event_ticker)
     candidates = []
-    skipped_untested = skipped_out_of_range = skipped_already_done = 0
+    skipped_not_in_group = skipped_out_of_range = skipped_already_done = 0
 
     for m in markets:
         ticker = m["ticker"]
         city = ticker.rsplit("-", 1)[-1]
 
-        if city not in VALIDATED_CITIES:
-            skipped_untested += 1
+        if city not in ACTIVE_CITIES:
+            skipped_not_in_group += 1
             continue
         if ticker in done:
             skipped_already_done += 1
@@ -272,7 +318,7 @@ def main():
         })
         placed += 1
 
-    print(f"\nDone. placed={placed}, skipped_untested_city={skipped_untested}, "
+    print(f"\nDone. placed={placed}, skipped_not_in_group_city={skipped_not_in_group}, "
           f"skipped_out_of_range={skipped_out_of_range}, skipped_already_done={skipped_already_done}")
 
 

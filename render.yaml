@@ -1,11 +1,19 @@
 services:
+  # Four cron entries, one per timezone group, replacing the old single
+  # 10:30 UTC entry (2026-09-03 fix). The backtest's price snapshot was
+  # ~24h before close, which lands at each group's own close hour on the
+  # OBSERVED day itself (Eastern ~04:00 UTC, Central ~05:00, Mountain
+  # ~06:00, Pacific ~07:00 -- see rain_bot.py's CITY_GROUPS). The old
+  # single 10:30 UTC fire always grabbed the FOLLOWING day's just-opened
+  # event instead, ~17-18h before the market had matured to the price the
+  # edge was validated on -- confirmed as the root cause of a real
+  # statistically significant live-vs-backtest gap (see project memory).
+  # A few minutes' buffer after each exact hour, same reasoning as the
+  # original single-schedule buffer.
   - type: cron
-    name: kalshi-rain-bot
+    name: kalshi-rain-bot-eastern
     runtime: python
-    # 10:30 UTC daily -- Kalshi opens each day's KXRAIN event at ~09:10 UTC
-    # the day before, so this leaves a safe buffer rather than risking a
-    # "not open yet" no-op if it ran right at the boundary.
-    schedule: "30 10 * * *"
+    schedule: "10 4 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python -u rain_bot.py
     envVars:
@@ -15,6 +23,80 @@ services:
         sync: false
       - key: KALSHI_PRIVATE_KEY_PEM
         sync: false
+      - key: CITY_GROUP
+        value: EASTERN
+      - key: STAKE_DOLLARS
+        value: "1"
+      - key: MIN_PRICE
+        value: "0.10"
+      - key: MAX_PRICE
+        value: "0.90"
+      - key: DRY_RUN
+        value: "false"
+
+  - type: cron
+    name: kalshi-rain-bot-central
+    runtime: python
+    schedule: "10 5 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u rain_bot.py
+    envVars:
+      - key: KALSHI_ENV
+        value: prod
+      - key: KALSHI_KEY_ID
+        sync: false
+      - key: KALSHI_PRIVATE_KEY_PEM
+        sync: false
+      - key: CITY_GROUP
+        value: CENTRAL
+      - key: STAKE_DOLLARS
+        value: "1"
+      - key: MIN_PRICE
+        value: "0.10"
+      - key: MAX_PRICE
+        value: "0.90"
+      - key: DRY_RUN
+        value: "false"
+
+  - type: cron
+    name: kalshi-rain-bot-mountain
+    runtime: python
+    schedule: "10 6 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u rain_bot.py
+    envVars:
+      - key: KALSHI_ENV
+        value: prod
+      - key: KALSHI_KEY_ID
+        sync: false
+      - key: KALSHI_PRIVATE_KEY_PEM
+        sync: false
+      - key: CITY_GROUP
+        value: MOUNTAIN
+      - key: STAKE_DOLLARS
+        value: "1"
+      - key: MIN_PRICE
+        value: "0.10"
+      - key: MAX_PRICE
+        value: "0.90"
+      - key: DRY_RUN
+        value: "false"
+
+  - type: cron
+    name: kalshi-rain-bot-pacific
+    runtime: python
+    schedule: "10 7 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u rain_bot.py
+    envVars:
+      - key: KALSHI_ENV
+        value: prod
+      - key: KALSHI_KEY_ID
+        sync: false
+      - key: KALSHI_PRIVATE_KEY_PEM
+        sync: false
+      - key: CITY_GROUP
+        value: PACIFIC
       - key: STAKE_DOLLARS
         value: "1"
       - key: MIN_PRICE
