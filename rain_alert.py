@@ -45,6 +45,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SERIES_PREFIX = "KXRAIN-"
 
+# Risk-management checkpoint (2026-08-31 decision, see project memory):
+# +$21 cumulative by day 14 (~Sept 9) to justify doubling STAKE_DOLLARS;
+# -$30 cumulative at any point is a stop-loss flag -- deliberately NOT an
+# auto-pause. User's explicit call: flag it in the alert and let them
+# decide manually (via DRY_RUN=true on Render) whether to actually stop,
+# rather than have the bot silently stop itself.
+STOP_LOSS_DOLLARS = float(os.getenv("STOP_LOSS_DOLLARS", "-30"))
+
 
 def send_telegram(message: str):
     print("TELEGRAM:", message)
@@ -192,15 +200,19 @@ def main():
     latest_event = max(fully_settled_events, key=parse_event_date)
     todays_rounds = by_event[latest_event]
 
-    settled_rounds = [r for r in rounds if results.get(r["ticker"])]
-
     total_staked = sum(r["cost"] + r["fee"] for r in todays_rounds)
     total_pnl = sum(net_pnl(r, results[r["ticker"]]) for r in todays_rounds)
     wins = sum(1 for r in todays_rounds if r["side"] == results[r["ticker"]])
     losses = len(todays_rounds) - wins
 
-    cumulative_pnl = sum(net_pnl(r, results[r["ticker"]]) for r in settled_rounds)
-    days_active = len({evt for evt in by_event if all(results.get(r["ticker"]) for r in by_event[evt])})
+    # cumulative must only include rounds from FULLY settled events, same
+    # gate as "todays_rounds"/"days_active" -- summing over settled_rounds
+    # (any ticker with a result, even from a still-partial day) silently
+    # mixed in a future day's partial results and mismatched the "(N days)"
+    # label with a dollar figure that actually reflected N+ days worth.
+    cumulative_rounds = [r for evt in fully_settled_events for r in by_event[evt]]
+    cumulative_pnl = sum(net_pnl(r, results[r["ticker"]]) for r in cumulative_rounds)
+    days_active = len(fully_settled_events)
 
     date_label = latest_event.replace(SERIES_PREFIX, "")
     message = (
@@ -208,6 +220,13 @@ def main():
         f"Staked ${total_staked:.2f} | Net {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}\n"
         f"Cumulative since launch: {'+' if cumulative_pnl >= 0 else ''}{cumulative_pnl:.2f} ({days_active} days)"
     )
+    if cumulative_pnl <= STOP_LOSS_DOLLARS:
+        message += (
+            f"\n\nSTOP-LOSS THRESHOLD HIT: cumulative ${cumulative_pnl:.2f} is at or "
+            f"beyond the ${STOP_LOSS_DOLLARS:.2f} stop-loss. Bot is still running -- "
+            f"this is a flag only, not an auto-pause. Set DRY_RUN=true on the "
+            f"kalshi-rain-bot Render service if you want to stop it."
+        )
     send_telegram(message)
 
 
